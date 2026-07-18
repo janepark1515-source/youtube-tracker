@@ -159,6 +159,8 @@ select.filter-select{padding:9px 12px; font-size:13.5px; width:100%;}
 .vcard-thumb-wrap img{width:100%; height:100%; object-fit:cover; display:block;}
 .thumb-hover-iframe{position:absolute; inset:0; width:100%; height:100%; border:0; pointer-events:none; z-index:1; opacity:0; transition:opacity .25s ease;}
 .thumb-hover-iframe.loaded{opacity:1;}
+.thumb-hover-shade{position:absolute; left:0; right:0; bottom:0; height:14px; background:linear-gradient(to top, rgba(0,0,0,.55), rgba(0,0,0,0)); pointer-events:none; z-index:1; opacity:0; transition:opacity .25s ease;}
+.thumb-hover-shade.loaded{opacity:1;}
 .badge-shorts{position:absolute; top:8px; left:8px; background:var(--purple); color:#fff; font-size:10.5px; font-weight:800; padding:3px 8px; border-radius:6px; letter-spacing:.03em; z-index:2;}
 .badge-noembed{position:absolute; top:8px; left:50%; transform:translateX(-50%); background:rgba(0,0,0,.78); color:#fff; font-size:10px; font-weight:700; padding:3px 9px; border-radius:6px; z-index:2; white-space:nowrap;}
 .thumb-play-overlay{position:absolute; inset:0; display:flex; align-items:center; justify-content:center; background:rgba(0,0,0,0); transition:background var(--anim); pointer-events:none; z-index:2;}
@@ -654,6 +656,7 @@ select.filter-select{padding:9px 12px; font-size:13.5px; width:100%;}
                 <button class="btn btn-danger btn-sm" data-clear="bookmarks">북마크 삭제</button>
                 <button class="btn btn-danger btn-sm" data-clear="collections">컬렉션 삭제</button>
                 <button class="btn btn-danger btn-sm" data-clear="viewhistory">조회수 기록 삭제</button>
+                <button class="btn btn-danger btn-sm" data-clear="apicache">API 캐시 삭제</button>
                 <button class="btn btn-danger btn-sm" data-clear="all">모든 데이터 초기화</button>
               </div>
             </div>
@@ -826,9 +829,18 @@ function loadJSON(key, fallback){
 }
 
 /* ---------- 11. STORAGE FUNCTIONS ---------- */
+let lastStorageErrorToastAt = 0;
 function saveState(key, value){
   try{ localStorage.setItem(key, JSON.stringify(value)); return true; }
-  catch(e){ console.error('storage write error', key, e); showToast('브라우저 저장 공간 오류가 발생했습니다.', 'err'); return false; }
+  catch(e){
+    console.error('storage write error', key, e);
+    const now = Date.now();
+    if(now - lastStorageErrorToastAt > 4000){ // 짧은 시간 안에 같은 오류가 반복돼도 토스트는 한 번만
+      lastStorageErrorToastAt = now;
+      showToast('브라우저 저장 공간 오류가 발생했습니다.', 'err');
+    }
+    return false;
+  }
 }
 function persistRecent(){ saveState(LS_KEYS.recent, appState.recentSearches); }
 function persistRefChannels(){ saveState(LS_KEYS.refChannels, appState.refChannels); }
@@ -863,6 +875,14 @@ function parseISO8601Duration(iso){
   const m = /^PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?$/.exec(iso||'');
   if(!m) return 0;
   return (parseInt(m[1]||0)*3600)+(parseInt(m[2]||0)*60)+parseInt(m[3]||0);
+}
+// 유튜브 숏츠 판정 기준(2024년 10월 개편 반영): 3분(180초) 이하 + 세로/정사각형 비율
+// 썸네일 가로세로 정보로 화면 비율을 추정하고, 정보가 없으면 길이만으로 보수적으로 판단
+// 유튜브 숏츠 판정 기준(2024년 10월 개편 반영): 원래는 "3분 이하 + 세로/정사각형 비율"이지만,
+// 유튜브 공개 API는 영상의 실제 화면 비율을 알려주는 필드를 제공하지 않고
+// (썸네일 width/height는 실제 영상 방향과 무관하게 항상 16:9로 고정되어 내려옴) 길이만으로 판단
+function isLikelyShort(durationSec){
+  return durationSec>0 && durationSec<=180;
 }
 function timeAgoLabel(iso){
   const diff = Date.now()-new Date(iso).getTime();
@@ -1000,8 +1020,19 @@ function setCache(key, value){
   const cache = loadJSON(LS_KEYS.cache, {});
   cache[key] = {t:Date.now(), v:value};
   const keys = Object.keys(cache);
-  if(keys.length>60){ keys.sort((a,b)=>cache[a].t-cache[b].t).slice(0,keys.length-60).forEach(k=>delete cache[k]); }
-  saveState(LS_KEYS.cache, cache);
+  const MAX_CACHE_ENTRIES = 30; // 트렌드/검색 응답 용량이 커서 여유 있게 줄여 저장 공간 부족을 예방
+  if(keys.length>MAX_CACHE_ENTRIES){ keys.sort((a,b)=>cache[a].t-cache[b].t).slice(0,keys.length-MAX_CACHE_ENTRIES).forEach(k=>delete cache[k]); }
+  try{
+    localStorage.setItem(LS_KEYS.cache, JSON.stringify(cache));
+  }catch(e){
+    // 캐시는 없어도 앱이 정상 동작하는 임시 데이터이므로, 저장 공간이 꽉 찼으면
+    // 사용자에게 오류를 띄우는 대신 캐시를 통째로 비우고 방금 항목만 다시 저장 시도 (자동 복구)
+    console.error('cache storage full — clearing API cache automatically', e);
+    try{
+      const fresh = {}; fresh[key] = {t:Date.now(), v:value};
+      localStorage.setItem(LS_KEYS.cache, JSON.stringify(fresh));
+    }catch(e2){ console.error('cache write still failing after clearing', e2); }
+  }
 }
 
 class ApiError extends Error{
@@ -1175,7 +1206,7 @@ function enrichVideoItems(videos, channelsMap){
       subscriberCount: parseInt(chStats.subscriberCount||0),
       channelViewCount: parseInt(chStats.viewCount||0), channelVideoCount: parseInt(chStats.videoCount||0),
       language: v.snippet.defaultAudioLanguage || v.snippet.defaultLanguage || '',
-      isShort: durationSec>0 && durationSec<=60, isDemo:false,
+      isShort: isLikelyShort(durationSec), isDemo:false,
       embeddable: !(v.status && v.status.embeddable===false), // 채널이 임베드(퍼가기)를 막아둔 영상인지 여부 (API가 명시적으로 false를 줄 때만 재생 불가로 판단)
       categoryId: v.snippet.categoryId, tags: v.snippet.tags||[]
     };
@@ -1202,17 +1233,29 @@ async function enrichVideos(videoIds){
   return enrichVideoItems(videos, channelsMap);
 }
 async function fetchGlobalTrending(regionCode){
-  let allVideos = [];
+  // 1) 공식 "인기 급상승" 차트 (2025.7월 정책 변경 이후 뮤직/영화/게임 위주라 롱폼에 치우쳐 있음)
+  let chartVideos = [];
   let token = undefined;
   let safety = 0;
   do{
     const res = await ytMostPopularList(regionCode, token);
-    allVideos = allVideos.concat(res.items||[]);
+    chartVideos = chartVideos.concat(res.items||[]);
     token = res.nextPageToken || null;
     safety++;
-  } while(token && allVideos.length < 150 && safety < 4);
-  const channelsMap = await fetchChannelsMapFor(allVideos);
-  return enrichVideoItems(allVideos, channelsMap);
+  } while(token && chartVideos.length < 100 && safety < 3);
+  const chartIds = chartVideos.map(v=>v.id);
+
+  // 2) 인기 급상승 차트엔 세로형 숏츠가 거의 없어서, 검색 API로 "최근 업로드 + 조회수 높은 순 + 짧은 영상"을 별도로 보강
+  //    (search.list의 videoDuration=short는 "4분 미만"을 뜻하므로, 이후 isLikelyShort()가 3분 이하 기준으로 다시 한번 정확히 걸러냄)
+  let shortsIds = [];
+  try{
+    const publishedAfter = new Date(Date.now() - 7*86400000).toISOString();
+    const shortsRes = await ytSearchList({ type:'video', order:'viewCount', regionCode, publishedAfter, videoDuration:'short', maxResults:50, videoEmbeddable:'true' });
+    shortsIds = (shortsRes.items||[]).map(it=>it.id && it.id.videoId).filter(Boolean);
+  }catch(e){ console.error('shorts trending fetch error', e); }
+
+  const uniqueIds = [...new Set([...chartIds, ...shortsIds])];
+  return enrichVideos(uniqueIds);
 }
 
 function filterDemoVideos(query){
@@ -1537,6 +1580,8 @@ function openModal(html, opts={}){
 function closeModal(){
   const overlay = document.getElementById('activeModalOverlay');
   if(!overlay) return;
+  const embedIframe = overlay.querySelector('#videoEmbedIframe');
+  if(embedIframe) unwatchYtError(embedIframe);
   overlay.classList.remove('open');
   document.body.style.overflow = '';
   setTimeout(()=>overlay.remove(), 200);
@@ -1549,6 +1594,59 @@ function modalHead(title, sub){
 }
 
 /* ---------- 17b. VIDEO PREVIEW (인라인 재생) ---------- */
+/* ---- 유튜브 임베드 플레이어의 실시간 오류 신호 감지 ----
+   API가 "임베드 가능"이라고 해도 저작권(ContentID) 등으로 실제 재생이 막히는 경우가 있어,
+   유튜브 iframe이 postMessage로 보내는 onError 이벤트를 직접 감지해서 깨진 화면 대신
+   조용히 원래 상태로 되돌리기 위한 공용 로직 */
+const YT_EMBED_ORIGIN = 'https://www.youtube.com';
+const ytIframeErrorHandlers = new Map(); // iframe element -> {onError, silenceTimer}
+function buildEmbedSrc(videoId, opts={}){
+  const params = new URLSearchParams({ autoplay:'1', rel:'0', enablejsapi:'1' });
+  if(window.location.origin && window.location.origin!=='null') params.set('origin', window.location.origin);
+  if(opts.hoverStyle){ params.set('mute','1'); params.set('controls','0'); params.set('loop','1'); params.set('playlist', videoId); params.set('modestbranding','1'); params.set('playsinline','1'); }
+  return `https://www.youtube.com/embed/${encodeURIComponent(videoId)}?${params.toString()}`;
+}
+function watchForYtError(iframe, onError){
+  const state = { onError, silenceTimer:null };
+  ytIframeErrorHandlers.set(iframe, state);
+  const sendListening = ()=>{ try{ iframe.contentWindow.postMessage(JSON.stringify({event:'listening', id:'rt'}), YT_EMBED_ORIGIN); }catch(e){} };
+  iframe.addEventListener('load', sendListening);
+  sendListening(); // load 이벤트를 놓치는 경우에 대비해 즉시 한 번 더 시도
+  setTimeout(sendListening, 800); // 약간의 지연 후 재시도 (플레이어 초기화 타이밍 대응)
+  // load 이벤트 발생 여부와 무관하게, iframe 생성 시점부터 무응답 타이머를 돌림
+  // (임베드가 완전히 막힌 경우 유튜브가 정상 플레이어 대신 오류 전용 페이지를 띄우고 postMessage 자체를 안 보내는 경우가 많음)
+  state.silenceTimer = setTimeout(()=>{
+    if(ytIframeErrorHandlers.has(iframe)){ ytIframeErrorHandlers.delete(iframe); onError('no_response'); }
+  }, 4000);
+}
+function unwatchYtError(iframe){
+  const state = ytIframeErrorHandlers.get(iframe);
+  if(state && state.silenceTimer) clearTimeout(state.silenceTimer);
+  ytIframeErrorHandlers.delete(iframe);
+}
+window.addEventListener('message', function(e){
+  if(e.origin !== YT_EMBED_ORIGIN) return;
+  let data;
+  try{ data = typeof e.data==='string' ? JSON.parse(e.data) : e.data; }catch(err){ return; }
+  if(!data || !data.event) return;
+  for(const [iframe, state] of ytIframeErrorHandlers.entries()){
+    if(!iframe.isConnected){ unwatchYtError(iframe); continue; }
+    if(iframe.contentWindow === e.source){
+      if(state.silenceTimer){ clearTimeout(state.silenceTimer); state.silenceTimer=null; } // 플레이어가 살아있다는 신호를 받았으니 무응답 타이머는 해제
+      if(data.event==='onError'){ ytIframeErrorHandlers.delete(iframe); state.onError(data.info); }
+      break;
+    }
+  }
+});
+function markVideoNotEmbeddable(videoId){
+  [appState.results, appState.bookmarks, appState.trendGlobalPool, window.__simCache||[]].forEach(list=>{
+    const v = (list||[]).find(x=>x.videoId===videoId);
+    if(v) v.embeddable = false;
+  });
+  // 화면에 이미 그려진 카드가 있으면 배지도 즉시 갱신
+  document.querySelectorAll(`.vcard[data-video-id="${CSS.escape(videoId)}"] .thumb-play-icon`).forEach(el=>el.textContent='🔒');
+}
+
 function openVideoPreviewModal(videoId){
   const v = findVideoById(videoId);
   if(!v){ showToast('영상 정보를 찾을 수 없습니다. 다시 시도해 주세요.', 'err'); return; }
@@ -1584,14 +1682,23 @@ function openVideoPreviewModal(videoId){
   }
   const html = `
     ${modalHead(v.title, v.channelTitle)}
-    <div class="video-embed-wrap">
-      <iframe src="https://www.youtube.com/embed/${encodeURIComponent(v.videoId)}?autoplay=1&rel=0" title="${escapeHtml(v.title)}" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" allowfullscreen referrerpolicy="strict-origin-when-cross-origin"></iframe>
+    <div class="video-embed-wrap" id="videoEmbedWrap">
+      <iframe id="videoEmbedIframe" src="${buildEmbedSrc(v.videoId)}" title="${escapeHtml(v.title)}" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" allowfullscreen referrerpolicy="strict-origin-when-cross-origin"></iframe>
     </div>
     <div class="modal-foot" style="justify-content:space-between; align-items:center;">
       <span style="font-size:11.5px; color:var(--text-3);">영상이 재생되지 않으면 채널에서 임베드를 막아둔 경우일 수 있어요.</span>
       <a class="btn btn-ghost btn-sm" href="${isSafeExternalUrl(watchUrl)?watchUrl:'#'}" target="_blank" rel="noopener noreferrer">🔗 유튜브에서 새 탭으로 열기</a>
     </div>`;
   openModal(html, {wide:true});
+  const modalIframe = document.getElementById('videoEmbedIframe');
+  if(modalIframe){
+    watchForYtError(modalIframe, ()=>{
+      markVideoNotEmbeddable(v.videoId);
+      const wrap = document.getElementById('videoEmbedWrap');
+      if(!wrap) return; // 이미 모달을 닫은 뒤라면 아무것도 안 함
+      wrap.outerHTML = `<div class="modal-body"><div class="preview-demo-notice"><div style="font-size:32px; margin-bottom:10px;">🔒</div><h3 style="font-size:15px; margin-bottom:8px; font-weight:700;">이 영상은 앱 안에서 재생할 수 없습니다</h3><p style="font-size:13px; color:var(--text-2); line-height:1.6;">저작권 또는 채널 설정으로 인해 이 영상은 외부 사이트에서 재생할 수 없어요.<br>유튜브에서 직접 보셔야 합니다.</p><a class="btn btn-primary" style="margin-top:16px;" href="${isSafeExternalUrl(watchUrl)?watchUrl:'#'}" target="_blank" rel="noopener noreferrer">🔗 유튜브에서 새 탭으로 보기</a></div></div>`;
+    });
+  }
 }
 
 /* ---- 마우스 오버 시 자동 음소거 미리보기 재생 ---- */
@@ -1618,16 +1725,25 @@ function injectHoverPreview(wrap, videoId){
   if(!wrap.isConnected || wrap.querySelector('.thumb-hover-iframe')) return;
   const iframe = document.createElement('iframe');
   iframe.className = 'thumb-hover-iframe';
-  iframe.src = `https://www.youtube.com/embed/${encodeURIComponent(videoId)}?autoplay=1&mute=1&controls=0&loop=1&playlist=${encodeURIComponent(videoId)}&modestbranding=1&rel=0&playsinline=1`;
+  iframe.src = buildEmbedSrc(videoId, {hoverStyle:true});
   iframe.setAttribute('allow','autoplay; encrypted-media');
   iframe.setAttribute('title','미리보기');
-  iframe.addEventListener('load', ()=>iframe.classList.add('loaded'));
+  const shade = document.createElement('div');
+  shade.className = 'thumb-hover-shade';
+  iframe.addEventListener('load', ()=>{ iframe.classList.add('loaded'); shade.classList.add('loaded'); });
+  watchForYtError(iframe, ()=>{
+    markVideoNotEmbeddable(videoId);
+    removeHoverPreview(wrap); // 에러 화면 대신 조용히 원래 정지 썸네일로 되돌림
+  });
   const img = wrap.querySelector('img');
   if(img && img.nextSibling){ wrap.insertBefore(iframe, img.nextSibling); } else { wrap.appendChild(iframe); }
+  wrap.appendChild(shade); // 재생바가 있는 맨 아래를 살짝 그림자로 가림 (영상 자체는 건드리지 않는 안전한 방식)
 }
 function removeHoverPreview(wrap){
   const iframe = wrap.querySelector('.thumb-hover-iframe');
-  if(iframe) iframe.remove();
+  if(iframe){ unwatchYtError(iframe); iframe.remove(); }
+  const shade = wrap.querySelector('.thumb-hover-shade');
+  if(shade) shade.remove();
 }
 // 카드가 계속 새로 그려지므로(innerHTML 교체) 개별 바인딩 대신 문서 전체에 위임 처리
 document.addEventListener('mouseover', function(e){
@@ -2277,6 +2393,7 @@ function clearDataByType(type){
   else if(type==='bookmarks'){ appState.bookmarks=[]; persistBookmarks(); if(appState.currentPage==='bookmarks') renderBookmarksPage(); }
   else if(type==='collections'){ appState.collections=[]; appState.collectionItems={}; persistCollections(); persistCollectionItems(); if(appState.currentPage==='collections') renderCollectionsPage(); }
   else if(type==='viewhistory'){ appState.viewHistory={}; persistViewHistory(); }
+  else if(type==='apicache'){ localStorage.removeItem(LS_KEYS.cache); }
   else if(type==='all'){
     Object.values(LS_KEYS).forEach(k=>localStorage.removeItem(k));
     location.reload(); return;
@@ -2603,7 +2720,7 @@ function bindStaticEventListeners(){
   document.getElementById('importFileInput').addEventListener('change', e=>{ if(e.target.files[0]) importDataFromFile(e.target.files[0]); e.target.value=''; });
   document.querySelectorAll('[data-clear]').forEach(b=>b.addEventListener('click', ()=>{
     const type=b.dataset.clear;
-    const label = {history:'검색 기록', channels:'레퍼런스 채널', bookmarks:'북마크', collections:'컬렉션', viewhistory:'조회수 기록', all:'모든 데이터'}[type];
+    const label = {history:'검색 기록', channels:'레퍼런스 채널', bookmarks:'북마크', collections:'컬렉션', viewhistory:'조회수 기록', apicache:'API 캐시', all:'모든 데이터'}[type];
     if(confirm(`${label}을(를) 삭제할까요? 이 작업은 되돌릴 수 없습니다.`)) clearDataByType(type);
   }));
 
