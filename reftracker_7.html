@@ -1606,18 +1606,18 @@ function buildEmbedSrc(videoId, opts={}){
   if(opts.hoverStyle){ params.set('mute','1'); params.set('controls','0'); params.set('loop','1'); params.set('playlist', videoId); params.set('modestbranding','1'); params.set('playsinline','1'); }
   return `https://www.youtube.com/embed/${encodeURIComponent(videoId)}?${params.toString()}`;
 }
-function watchForYtError(iframe, onError){
+function watchForYtError(iframe, onError, timeoutMs){
   const state = { onError, silenceTimer:null };
   ytIframeErrorHandlers.set(iframe, state);
   const sendListening = ()=>{ try{ iframe.contentWindow.postMessage(JSON.stringify({event:'listening', id:'rt'}), YT_EMBED_ORIGIN); }catch(e){} };
   iframe.addEventListener('load', sendListening);
   sendListening(); // load 이벤트를 놓치는 경우에 대비해 즉시 한 번 더 시도
-  setTimeout(sendListening, 800); // 약간의 지연 후 재시도 (플레이어 초기화 타이밍 대응)
+  setTimeout(sendListening, 500); // 약간의 지연 후 재시도 (플레이어 초기화 타이밍 대응)
   // load 이벤트 발생 여부와 무관하게, iframe 생성 시점부터 무응답 타이머를 돌림
   // (임베드가 완전히 막힌 경우 유튜브가 정상 플레이어 대신 오류 전용 페이지를 띄우고 postMessage 자체를 안 보내는 경우가 많음)
   state.silenceTimer = setTimeout(()=>{
     if(ytIframeErrorHandlers.has(iframe)){ ytIframeErrorHandlers.delete(iframe); onError('no_response'); }
-  }, 4000);
+  }, timeoutMs || 4000);
 }
 function unwatchYtError(iframe){
   const state = ytIframeErrorHandlers.get(iframe);
@@ -1730,14 +1730,18 @@ function injectHoverPreview(wrap, videoId){
   iframe.setAttribute('title','미리보기');
   const shade = document.createElement('div');
   shade.className = 'thumb-hover-shade';
-  iframe.addEventListener('load', ()=>{ iframe.classList.add('loaded'); shade.classList.add('loaded'); });
   watchForYtError(iframe, ()=>{
     markVideoNotEmbeddable(videoId);
     removeHoverPreview(wrap); // 에러 화면 대신 조용히 원래 정지 썸네일로 되돌림
-  });
+  }, 1800);
   const img = wrap.querySelector('img');
   if(img && img.nextSibling){ wrap.insertBefore(iframe, img.nextSibling); } else { wrap.appendChild(iframe); }
   wrap.appendChild(shade); // 재생바가 있는 맨 아래를 살짝 그림자로 가림 (영상 자체는 건드리지 않는 안전한 방식)
+  // 재생 가능 여부를 먼저 확인할 시간을 벌기 위해, 곧바로 보여주지 않고 짧게 대기 후에만 화면에 노출
+  // (막힌 영상이면 이 시간 안에 위 오류 감지가 먼저 지우기 때문에, 깨진 화면이 눈에 보일 틈이 거의 없음)
+  setTimeout(()=>{
+    if(iframe.isConnected){ iframe.classList.add('loaded'); shade.classList.add('loaded'); }
+  }, 1000);
 }
 function removeHoverPreview(wrap){
   const iframe = wrap.querySelector('.thumb-hover-iframe');
